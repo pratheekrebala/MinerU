@@ -9,6 +9,13 @@ PUBLIC_HTTP_CLIENT_DISABLED_DETAIL = (
     "--allow-public-http-client if you understand the SSRF risk."
 )
 
+PUBLIC_URL_FETCH_DISABLED_DETAIL = (
+    "Publicly exposed API disables server-side file_urls fetching by default "
+    "because it lets callers drive outbound requests from the server (SSRF "
+    "risk). Rebind to 127.0.0.1 or start with --allow-public-http-client if "
+    "you understand the risk."
+)
+
 
 def is_public_bind_host(host: str) -> bool:
     return host in {"0.0.0.0", "::"}
@@ -35,6 +42,21 @@ def validate_public_http_client_request(
         return
     if backend.endswith("-http-client") or bool(server_url and server_url.strip()):
         raise HTTPException(status_code=400, detail=PUBLIC_HTTP_CLIENT_DISABLED_DETAIL)
+
+
+def validate_url_fetch_request(
+    *,
+    public_bind_exposed: bool,
+    allow_public_http_client: bool,
+    file_urls: list[str] | None,
+) -> None:
+    """Gate server-side file_urls fetching behind the same SSRF safeguard used for
+    *-http-client backends: when the API is publicly bound and the operator has not
+    opted in, reject requests that ask the server to fetch arbitrary URLs."""
+    if not public_bind_exposed or allow_public_http_client:
+        return
+    if file_urls and any(url and url.strip() for url in file_urls):
+        raise HTTPException(status_code=400, detail=PUBLIC_URL_FETCH_DISABLED_DETAIL)
 
 
 def warn_if_public_http_client_policy(

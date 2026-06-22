@@ -12,7 +12,10 @@ from mineru.cli.backend_options import (
     validate_backend as validate_public_backend,
     validate_effort as validate_public_effort,
 )
-from mineru.cli.public_http_client_policy import validate_public_http_client_request
+from mineru.cli.public_http_client_policy import (
+    validate_public_http_client_request,
+    validate_url_fetch_request,
+)
 from mineru.utils.ocr_language import (
     PUBLIC_OCR_LANGUAGE_SCHEMA_EXTRA,
     format_public_ocr_lang_description,
@@ -32,6 +35,7 @@ class ParseRequestOptions:
     """保存公开解析接口共用的表单参数，供 API 与 Router 复用。"""
 
     files: list[UploadFile]
+    file_urls: list[str]
     lang_list: list[str]
     backend: str
     effort: str
@@ -97,7 +101,18 @@ async def parse_request_form(
             description="Upload PDF, image, DOCX, PPTX, or XLSX files for parsing",
             json_schema_extra=SWAGGER_UI_FILE_ARRAY_SCHEMA_EXTRA,
         ),
-    ],
+    ] = [],
+    file_urls: Annotated[
+        list[str],
+        Form(
+            description=(
+                "Links the server fetches itself instead of uploading bytes. "
+                "Resolved via fsspec by URL scheme: s3://, gs:// (gcs://), az://, "
+                "http(s):// (including presigned object-store URLs), file://. "
+                "Provide either files or file_urls, not both."
+            ),
+        ),
+    ] = [],
     lang_list: Annotated[
         list[str],
         Form(
@@ -213,15 +228,32 @@ async def parse_request_form(
     """解析 API/Router 共用的 multipart 表单，并保持 Swagger 参数同源。"""
     backend = validate_parse_backend(backend)
     effort = validate_parse_effort(effort)
+
+    # Drop empty entries multipart clients sometimes send for absent fields.
+    files = [f for f in (files or []) if getattr(f, "filename", None)]
+    file_urls = [u.strip() for u in (file_urls or []) if u and u.strip()]
+    if bool(files) == bool(file_urls):
+        raise HTTPException(
+            status_code=400,
+            detail="Provide exactly one of `files` (uploaded bytes) or `file_urls` (links).",
+        )
+
+    public_bind_exposed = bool(
+        getattr(request.app.state, "public_bind_exposed", False)
+    )
+    allow_public_http_client = bool(
+        getattr(request.app.state, "allow_public_http_client", False)
+    )
     validate_public_http_client_request(
-        public_bind_exposed=bool(
-            getattr(request.app.state, "public_bind_exposed", False)
-        ),
-        allow_public_http_client=bool(
-            getattr(request.app.state, "allow_public_http_client", False)
-        ),
+        public_bind_exposed=public_bind_exposed,
+        allow_public_http_client=allow_public_http_client,
         backend=backend,
         server_url=server_url,
+    )
+    validate_url_fetch_request(
+        public_bind_exposed=public_bind_exposed,
+        allow_public_http_client=allow_public_http_client,
+        file_urls=file_urls,
     )
     if client_side_output_generation:
         return_md = False
@@ -233,6 +265,7 @@ async def parse_request_form(
     effective_return_original_file = return_original_file and response_format_zip
     return ParseRequestOptions(
         files=files,
+        file_urls=file_urls,
         lang_list=validate_parse_lang_list(lang_list),
         backend=backend,
         effort=effort,

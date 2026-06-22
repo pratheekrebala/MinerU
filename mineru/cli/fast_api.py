@@ -43,6 +43,7 @@ from mineru.cli.common import (
     uniquify_task_stems,
 )
 from mineru.cli.api_request import ParseRequestOptions, parse_request_form
+from mineru.cli.url_fetch import fetch_url_to_dir
 from mineru.cli.public_http_client_policy import (
     configure_public_http_client_policy,
     is_public_bind_host,
@@ -782,6 +783,14 @@ async def save_upload_files(upload_dir: str, files: list[UploadFile]) -> list[St
         finally:
             await upload.close()
 
+    return dedupe_upload_stems(uploads)
+
+
+def dedupe_upload_stems(uploads: list[StoredUpload]) -> list[StoredUpload]:
+    """Ensure task stems are unique within a single request, renaming collisions.
+
+    Shared by the multipart-upload and file_urls fetch paths so both dedupe
+    identically before tasks are created."""
     normalized_stems, renamed_stems = uniquify_task_stems(
         [upload.stem for upload in uploads]
     )
@@ -883,8 +892,18 @@ async def create_async_parse_task(
     task_manager = get_task_manager()
 
     try:
-        uploads = await save_upload_files(uploads_dir, request_options.files)
-        request_options.files.clear()
+        if request_options.file_urls:
+            os.makedirs(uploads_dir, exist_ok=True)
+            uploads = await asyncio.gather(
+                *[
+                    asyncio.to_thread(fetch_url_to_dir, url, uploads_dir)
+                    for url in request_options.file_urls
+                ]
+            )
+            uploads = dedupe_upload_stems(list(uploads))
+        else:
+            uploads = await save_upload_files(uploads_dir, request_options.files)
+            request_options.files.clear()
         file_names = [upload.stem for upload in uploads]
         task = AsyncParseTask(
             task_id=task_id,
