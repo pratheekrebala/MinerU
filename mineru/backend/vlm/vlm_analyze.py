@@ -68,7 +68,10 @@ class ModelSingleton:
                 lmdeploy_engine = None
                 vllm_async_llm = None
                 batch_size = kwargs.get("batch_size", 0)  # for transformers backend only
-                max_concurrency = kwargs.get("max_concurrency", 100)  # for http-client backend only
+                max_concurrency = kwargs.get(
+                    "max_concurrency",
+                    int(os.getenv("MINERU_VLM_HTTP_MAX_CONCURRENCY", "100")),
+                )  # for http-client backend only
                 http_timeout = kwargs.get("http_timeout", 600)  # for http-client backend only
                 server_headers = kwargs.get("server_headers", None)  # for http-client backend only
                 max_retries = kwargs.get("max_retries", 3)  # for http-client backend only
