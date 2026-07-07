@@ -453,6 +453,24 @@ class JobAsyncResponse(BaseModel):
     links: JobLinks
 
 
+class SyncJobFileResult(BaseModel):
+    model_config = _PYDANTIC_CONFIG
+    name: str
+    page_range: str
+    status: FileStatus
+    parse: FileParseInfo | None = None
+    outputs: dict[str, Any] | None = None
+    error: ErrorDetail | None = None
+
+
+class SyncParseResponse(BaseModel):
+    model_config = _PYDANTIC_CONFIG
+    status: Literal["completed", "partial", "failed", "canceled"]
+    tier: Tier
+    output_formats: list[OutputFormat]
+    files: list[SyncJobFileResult]
+
+
 class JobListItem(BaseModel):
     model_config = _PYDANTIC_CONFIG
     job_id: str
@@ -1282,6 +1300,98 @@ def _suffix_type(filename: str) -> str:
     return _SUPPORTED_SUFFIXES.get(ext, "")
 
 
+def _invalid_request(message: str, *, code: str = "invalid_request", status_code: int = 400) -> HTTPException:
+    return HTTPException(
+        status_code=status_code,
+        detail=ErrorResponse(
+            error=ErrorDetail(
+                type="invalid_request_error",
+                code=code,
+                message=message,
+            ),
+        ).model_dump(by_alias=True),
+    )
+
+
+def _validate_local_output_formats(
+    output_formats: list[OutputFormat],
+    *,
+    access_level: AccessLevel | None = None,
+) -> None:
+    for fmt in output_formats:
+        if access_level == "anonymous" and fmt in ("html", "latex", "docx"):
+            raise HTTPException(
+                status_code=403,
+                detail=ErrorResponse(
+                    error=ErrorDetail(
+                        type="permission_error",
+                        code="feature_requires_api_key",
+                        message=f"Output format '{fmt}' requires an API key",
+                    ),
+                ).model_dump(by_alias=True),
+            )
+        if fmt not in _OUTPUT_FORMATS_LOCAL:
+            raise _invalid_request(f"Unknown output format: {fmt}")
+
+
+def _resolve_runtime_kwargs(request: Request, body: CreateJobRequest) -> dict[str, Any]:
+    body.tier = body.tier or request.app.state.default_tier
+    runtime_options: dict[Tier, ParserRuntimeOptions] = request.app.state.tier_runtime_options
+    runtime = runtime_options.get(body.tier)
+    if runtime is None:
+        raise _invalid_request(f"Tier '{body.tier}' not available in this server")
+    return {
+        "server_backend": runtime.backend,
+        "language": request.app.state.language,
+        "ocr_mode": request.app.state.ocr_mode,
+        "effort": runtime.effort,
+        "image_analysis": request.app.state.image_analysis,
+        "url_timeout": request.app.state.url_timeout,
+    }
+
+
+def _read_output(file_store: FileStore, ref: OutputFileRef | None, *, as_json: bool = False) -> Any:
+    if ref is None:
+        return None
+    data = file_store.read_file_data(ref.file_id)
+    if as_json:
+        return json.loads(data.decode("utf-8"))
+    return data.decode("utf-8")
+
+
+def _inline_output_files(
+    file_store: FileStore,
+    output_files: OutputFiles | None,
+    output_formats: list[OutputFormat],
+) -> dict[str, Any]:
+    if output_files is None:
+        return {}
+
+    requested = set(output_formats)
+    outputs: dict[str, Any] = {}
+    if "markdown" in requested:
+        outputs["markdown"] = _read_output(file_store, output_files.markdown)
+    for key in ("middle_json", "content_list", "structured_content"):
+        if key in requested:
+            outputs[key] = _read_output(file_store, getattr(output_files, key), as_json=True)
+    if "zip" in requested and output_files.zip is not None:
+        data = file_store.read_file_data(output_files.zip.file_id)
+        outputs["zip"] = {
+            "bytes": output_files.zip.bytes,
+            "data": base64.b64encode(data).decode("ascii"),
+        }
+    if "images" in requested and output_files.images:
+        outputs["images"] = [
+            {
+                "path": image.path,
+                "bytes": image.bytes,
+                "data": base64.b64encode(file_store.read_file_data(image.file_id)).decode("ascii"),
+            }
+            for image in output_files.images
+        ]
+    return outputs
+
+
 async def _run_job(
     rec: _JobRecord,
     req: CreateJobRequest,
@@ -1675,6 +1785,84 @@ async def delete_file(
 
 
 @_router.post(
+    "/parse",
+    response_model=SyncParseResponse,
+    status_code=status.HTTP_200_OK,
+    responses={**_ERR_400, **_ERR_403, **_ERR_429},
+    tags=["Parse"],
+)
+async def parse_sync(
+    body: CreateJobRequest,
+    request: Request,
+    job_store: JobStore = Depends(_get_job_store),
+) -> SyncParseResponse:
+    """Parse files synchronously and return inlined outputs."""
+    if body.callback is not None:
+        raise _invalid_request("Webhook callback is not supported by the synchronous parse endpoint.")
+
+    for entry in body.files:
+        if isinstance(entry.source, FileIdSource):
+            raise _invalid_request(
+                "file_id sources require the stateful Files API. Use url, inline, or local sources."
+            )
+
+    _validate_local_output_formats(body.output_formats)
+    kwargs = _resolve_runtime_kwargs(request, body)
+
+    with tempfile.TemporaryDirectory(prefix="mineru_sync_") as tmpdir:
+        sync_store = FileStore(pathlib.Path(tmpdir))
+        rec = _JobRecord(
+            id="sync_" + secrets.token_hex(12),
+            status="queued",
+            created_at=JobStore._now(),
+            tier=body.tier,
+            output_formats=body.output_formats,
+            progress=JobProgress(total=len(body.files)),
+            files=[
+                JobFileResult(
+                    name=_source_name(entry.source),
+                    page_range=entry.page_range or "",
+                    status="queued",
+                )
+                for entry in body.files
+            ],
+        )
+
+        async with job_store._semaphore:
+            try:
+                await _run_job(rec, body, sync_store, **kwargs)
+            except Exception as exc:
+                logger.exception("Synchronous parse failed unexpectedly")
+                raise HTTPException(
+                    status_code=500,
+                    detail=ErrorResponse(
+                        error=ErrorDetail(
+                            type="engine_error",
+                            code="parse_failed",
+                            message=str(exc),
+                        ),
+                    ).model_dump(by_alias=True),
+                ) from exc
+
+        return SyncParseResponse(
+            status=rec.status,
+            tier=rec.tier,
+            output_formats=rec.output_formats,
+            files=[
+                SyncJobFileResult(
+                    name=file_result.name,
+                    page_range=file_result.page_range,
+                    status=file_result.status,
+                    parse=file_result.parse,
+                    outputs=_inline_output_files(sync_store, file_result.output_files, rec.output_formats),
+                    error=file_result.error,
+                )
+                for file_result in rec.files
+            ],
+        )
+
+
+@_router.post(
     "/parse/jobs",
     response_model=None,
     status_code=status.HTTP_202_ACCEPTED,
@@ -1710,30 +1898,7 @@ async def create_job(
             ).model_dump(by_alias=True),
         )
 
-    # validate output formats — advanced formats require API key
-    for fmt in body.output_formats:
-        if fmt in ("html", "latex", "docx") and access_level == "anonymous":
-            raise HTTPException(
-                status_code=403,
-                detail=ErrorResponse(
-                    error=ErrorDetail(
-                        type="permission_error",
-                        code="feature_requires_api_key",
-                        message=f"Output format '{fmt}' requires an API key",
-                    ),
-                ).model_dump(by_alias=True),
-            )
-        if fmt not in _OUTPUT_FORMATS_LOCAL:
-            raise HTTPException(
-                status_code=400,
-                detail=ErrorResponse(
-                    error=ErrorDetail(
-                        type="invalid_request_error",
-                        code="invalid_request",
-                        message=f"Unknown output format: {fmt}",
-                    ),
-                ).model_dump(by_alias=True),
-            )
+    _validate_local_output_formats(body.output_formats, access_level=access_level)
 
     # validate wait vs server limit
     max_wait: int = request.app.state.max_wait
@@ -1749,45 +1914,12 @@ async def create_job(
             ).model_dump(by_alias=True),
         )
 
-    # 按请求 tier 选择启动时预先解析好的 runtime，避免所有 job 共享默认 effort。
-    body.tier = body.tier or request.app.state.default_tier
-    runtime_options: dict[Tier, ParserRuntimeOptions] = request.app.state.tier_runtime_options
-    runtime = runtime_options.get(body.tier)
-    if runtime is None:
-        raise HTTPException(
-            status_code=400,
-            detail=ErrorResponse(
-                error=ErrorDetail(
-                    type="invalid_request_error",
-                    code="invalid_request",
-                    message=f"Tier '{body.tier}' not available in this server",
-                ),
-            ).model_dump(by_alias=True),
-        )
-
+    kwargs = _resolve_runtime_kwargs(request, body)
     rec = job_store.create(body, file_store)
-    backend = runtime.backend
-    url_timeout_val: int = request.app.state.url_timeout
-    language_val: str = request.app.state.language
-    ocr_mode_val: str = request.app.state.ocr_mode
-    effort_val = runtime.effort
-    image_analysis_val: bool = request.app.state.image_analysis
 
     if body.wait > 0:
         async with job_store._semaphore:
-            task = asyncio.create_task(
-                _run_job(
-                    rec,
-                    body,
-                    file_store,
-                    server_backend=backend,
-                    language=language_val,
-                    ocr_mode=ocr_mode_val,
-                    effort=effort_val,
-                    image_analysis=image_analysis_val,
-                    url_timeout=url_timeout_val,
-                )
-            )
+            task = asyncio.create_task(_run_job(rec, body, file_store, **kwargs))
             try:
                 await asyncio.wait_for(task, timeout=body.wait)
             except asyncio.TimeoutError:
@@ -1805,17 +1937,7 @@ async def create_job(
     # async — fire and forget
     async def _bg_run() -> None:
         async with job_store._semaphore:
-            await _run_job(
-                rec,
-                body,
-                file_store,
-                server_backend=backend,
-                language=language_val,
-                ocr_mode=ocr_mode_val,
-                effort=effort_val,
-                image_analysis=image_analysis_val,
-                url_timeout=url_timeout_val,
-            )
+            await _run_job(rec, body, file_store, **kwargs)
 
     asyncio.create_task(_bg_run())
     return JSONResponse(content=job_store.build_response(rec).model_dump(by_alias=True), status_code=202)
