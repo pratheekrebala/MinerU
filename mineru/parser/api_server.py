@@ -2185,6 +2185,33 @@ def _preflight_runtime_dependencies(runtime_options: dict[Tier, ParserRuntimeOpt
         _preflight_tier_dependencies(dependency_tier)
 
 
+def _runtime_needs_local_vlm(runtime: ParserRuntimeOptions) -> bool:
+    return runtime.backend.startswith("hybrid-") and runtime.effort != "medium"
+
+
+async def _preload_local_vlm(tier_runtime_options: dict[Tier, ParserRuntimeOptions]) -> None:
+    if not any(_runtime_needs_local_vlm(runtime) for runtime in tier_runtime_options.values()):
+        logger.info("VLM preload skipped: no exposed tier requires local VLM inference")
+        return
+
+    try:
+        from ..model.vlm.runtime import ModelSingleton
+        from ..utils.engine_utils import get_vlm_engine
+    except Exception as exc:
+        logger.warning("VLM preload aborted after import failure: %s", exc)
+        return
+
+    vlm_engine = get_vlm_engine("auto", is_async=True)
+    started = time.monotonic()
+    logger.info("Preloading local VLM engine: %s", vlm_engine)
+    try:
+        await asyncio.to_thread(ModelSingleton().get_model, vlm_engine, None, None)
+    except Exception:
+        logger.exception("VLM preload failed; falling back to lazy load")
+        return
+    logger.info("VLM preload complete in %.1fs", time.monotonic() - started)
+
+
 def create_app(
     *,
     upload_dir: str = "",
@@ -2257,6 +2284,8 @@ def create_app(
         application.state.ocr_mode = ocr_mode
         application.state.effort = effort
         application.state.image_analysis = image_analysis
+        if _env_flag("MINERU_ENABLE_VLM_PRELOAD", default=False) and not os.getenv("MINERU_VLM_SERVER_URL"):
+            await _preload_local_vlm(tier_runtime_options)
         yield
         if not upload_dir and _upload_dir.exists():
             shutil.rmtree(_upload_dir, ignore_errors=True)
