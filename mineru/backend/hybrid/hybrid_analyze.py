@@ -1456,39 +1456,45 @@ def _extract_with_local_layout(
         formula_enable=True,
     )
     np_images = [np.asarray(pil_image).copy() for pil_image in images_pil_list]
-    images_layout_res = run_layout_inference(
-        local_context.layout_model.batch_predict,
-        images_pil_list,
-        batch_size=min(8, batch_ratio * LAYOUT_BASE_BATCH_SIZE),
-    )
-    clean_vram(local_context.device, vram_threshold=8)
-    mfd_res = _run_medium_formula_recognition(
-        local_context,
-        images_layout_res,
-        np_images,
-        batch_ratio,
-    )
-    clean_vram(local_context.device, vram_threshold=8)
-    _apply_medium_table_recognition(
-        local_context,
-        images_layout_res,
-        np_images,
-        [language for _ in images_pil_list],
-        batch_ratio,
-    )
+    with _metrics.phase_timer("local_layout"):
+        images_layout_res = run_layout_inference(
+            local_context.layout_model.batch_predict,
+            images_pil_list,
+            batch_size=min(8, batch_ratio * LAYOUT_BASE_BATCH_SIZE),
+        )
+    with _metrics.phase_timer("memory_cleanup"):
+        clean_vram(local_context.device, vram_threshold=8)
+    with _metrics.phase_timer("medium_formula_recognition"):
+        mfd_res = _run_medium_formula_recognition(
+            local_context,
+            images_layout_res,
+            np_images,
+            batch_ratio,
+        )
+    with _metrics.phase_timer("memory_cleanup"):
+        clean_vram(local_context.device, vram_threshold=8)
+    with _metrics.phase_timer("medium_table_recognition"):
+        _apply_medium_table_recognition(
+            local_context,
+            images_layout_res,
+            np_images,
+            [language for _ in images_pil_list],
+            batch_ratio,
+        )
     _apply_medium_seal_ocr(local_context, images_layout_res, np_images)
     _apply_medium_formula_number_ocr(local_context, images_layout_res, np_images)
     _prune_medium_empty_ocr_text_blocks(images_layout_res, _ocr_enable)
     medium_model_list = _build_medium_hybrid_model_list(images_layout_res, images_pil_list)
-    ocr_res_list = _ocr_det(
-        local_context,
-        np_images,
-        medium_model_list,
-        mfd_res,
-        _ocr_enable,
-        batch_ratio=batch_ratio,
-        candidate_fn=_is_hybrid_medium_ocr_det_candidate,
-    )
+    with _metrics.phase_timer("ocr_det"):
+        ocr_res_list = _ocr_det(
+            local_context,
+            np_images,
+            medium_model_list,
+            mfd_res,
+            _ocr_enable,
+            batch_ratio=batch_ratio,
+            candidate_fn=_is_hybrid_medium_ocr_det_candidate,
+        )
     if _ocr_enable:
         # medium 路径也需要在合并 sidecar 前完成 OCR rec，否则 ocr_text 只保留空文本裁剪。
         _apply_ocr_rec_results(local_context, ocr_res_list)
@@ -1572,12 +1578,13 @@ def _apply_ocr_rec_results(
     if not img_crop_list:
         return
 
-    ocr_result_list = run_ocr_inference(
-        local_context.ocr_model.ocr,
-        img_crop_list,
-        det=False,
-        tqdm_enable=True,
-    )[0]
+    with _metrics.phase_timer("ocr_rec"):
+        ocr_result_list = run_ocr_inference(
+            local_context.ocr_model.ocr,
+            img_crop_list,
+            det=False,
+            tqdm_enable=True,
+        )[0]
 
     if len(ocr_result_list) != len(need_ocr_list):
         raise ValueError(
@@ -1627,17 +1634,19 @@ def _process_ocr_and_formulas(
     if images_layout_res is None:
         # 没有外部复用的 layout 时，按旧逻辑为公式和标题拆分补跑一次本地 layout。
         layout_images = _mask_image_regions(np_images, model_list)
-        images_layout_res = _predict_layout_for_title_split(local_context, layout_images, batch_ratio)
+        with _metrics.phase_timer("local_layout"):
+            images_layout_res = _predict_layout_for_title_split(local_context, layout_images, batch_ratio)
 
     images_mfd_res = _build_inline_formula_inputs(images_layout_res)
     # 公式识别
-    inline_formula_list = run_mfr_inference(
-        local_context.mfr_model.batch_predict,
-        images_mfd_res,
-        np_images,
-        batch_size=batch_ratio * MFR_BASE_BATCH_SIZE,
-        interline_enable=True,
-    )
+    with _metrics.phase_timer("medium_formula_recognition"):
+        inline_formula_list = run_mfr_inference(
+            local_context.mfr_model.batch_predict,
+            images_mfd_res,
+            np_images,
+            batch_size=batch_ratio * MFR_BASE_BATCH_SIZE,
+            interline_enable=True,
+        )
 
     mfd_res = []
     for page_inline_formula_list in inline_formula_list:
@@ -1650,14 +1659,15 @@ def _process_ocr_and_formulas(
         mfd_res.append(page_mfd_res)
 
     # vlm没有执行ocr，需要ocr_det
-    ocr_res_list = _ocr_det(
-        local_context,
-        np_images,
-        model_list,
-        mfd_res,
-        _ocr_enable,
-        batch_ratio=batch_ratio,
-    )
+    with _metrics.phase_timer("ocr_det"):
+        ocr_res_list = _ocr_det(
+            local_context,
+            np_images,
+            model_list,
+            mfd_res,
+            _ocr_enable,
+            batch_ratio=batch_ratio,
+        )
 
     # 如果需要ocr则做ocr_rec
     if _ocr_enable:
@@ -1693,33 +1703,37 @@ def _extract_high_with_local_layout(
         formula_enable=not _ocr_enable,
     )
     np_images = [np.asarray(pil_image).copy() for pil_image in images_pil_list]
-    images_layout_res = _predict_layout_for_title_split(local_context, np_images, batch_ratio)
+    with _metrics.phase_timer("local_layout"):
+        images_layout_res = _predict_layout_for_title_split(local_context, np_images, batch_ratio)
     layout_blocks = _build_high_layout_blocks(images_layout_res, images_pil_list)
-    window_model_list = predictor.batch_extract_with_layout(
-        images=images_pil_list,
-        blocks_list=layout_blocks,
-        not_extract_list=None if _ocr_enable else list(NOT_EXTRACT_TYPES),
-        image_analysis=False,
-    )
+    with _metrics.phase_timer("vlm_extraction"):
+        window_model_list = predictor.batch_extract_with_layout(
+            images=images_pil_list,
+            blocks_list=layout_blocks,
+            not_extract_list=None if _ocr_enable else list(NOT_EXTRACT_TYPES),
+            image_analysis=False,
+        )
     if _ocr_enable:
-        local_context = _apply_vlm_text_det_sidecars_for_window(
-            images_pil_list,
-            window_model_list,
-            language,
-            batch_ratio,
-            images_layout_res=images_layout_res,
-            local_context=local_context,
-        )
+        with _metrics.phase_timer("vlm_local_postprocess"):
+            local_context = _apply_vlm_text_det_sidecars_for_window(
+                images_pil_list,
+                window_model_list,
+                language,
+                batch_ratio,
+                images_layout_res=images_layout_res,
+                local_context=local_context,
+            )
     else:
-        window_model_list, local_context = _process_ocr_and_formulas(
-            images_pil_list,
-            window_model_list,
-            language,
-            False,
-            batch_ratio=batch_ratio,
-            local_context=local_context,
-            images_layout_res=images_layout_res,
-        )
+        with _metrics.phase_timer("vlm_local_postprocess"):
+            window_model_list, local_context = _process_ocr_and_formulas(
+                images_pil_list,
+                window_model_list,
+                language,
+                False,
+                batch_ratio=batch_ratio,
+                local_context=local_context,
+                images_layout_res=images_layout_res,
+            )
     return window_model_list, local_context
 
 
@@ -1738,41 +1752,45 @@ async def _aio_extract_high_with_local_layout(
         formula_enable=not _ocr_enable,
     )
     np_images = [np.asarray(pil_image).copy() for pil_image in images_pil_list]
-    images_layout_res = await asyncio.to_thread(
-        _predict_layout_for_title_split,
-        local_context,
-        np_images,
-        batch_ratio,
-    )
+    with _metrics.phase_timer("local_layout"):
+        images_layout_res = await asyncio.to_thread(
+            _predict_layout_for_title_split,
+            local_context,
+            np_images,
+            batch_ratio,
+        )
     layout_blocks = _build_high_layout_blocks(images_layout_res, images_pil_list)
-    window_model_list = await predictor.aio_batch_extract_with_layout(
-        images=images_pil_list,
-        blocks_list=layout_blocks,
-        not_extract_list=None if _ocr_enable else list(NOT_EXTRACT_TYPES),
-        semaphore=semaphore,
-        image_analysis=False,
-    )
+    with _metrics.phase_timer("vlm_extraction"):
+        window_model_list = await predictor.aio_batch_extract_with_layout(
+            images=images_pil_list,
+            blocks_list=layout_blocks,
+            not_extract_list=None if _ocr_enable else list(NOT_EXTRACT_TYPES),
+            semaphore=semaphore,
+            image_analysis=False,
+        )
     if _ocr_enable:
-        local_context = await asyncio.to_thread(
-            _apply_vlm_text_det_sidecars_for_window,
-            images_pil_list,
-            window_model_list,
-            language,
-            batch_ratio,
-            images_layout_res=images_layout_res,
-            local_context=local_context,
-        )
+        with _metrics.phase_timer("vlm_local_postprocess"):
+            local_context = await asyncio.to_thread(
+                _apply_vlm_text_det_sidecars_for_window,
+                images_pil_list,
+                window_model_list,
+                language,
+                batch_ratio,
+                images_layout_res=images_layout_res,
+                local_context=local_context,
+            )
     else:
-        window_model_list, local_context = await asyncio.to_thread(
-            _process_ocr_and_formulas,
-            images_pil_list,
-            window_model_list,
-            language,
-            False,
-            batch_ratio,
-            local_context=local_context,
-            images_layout_res=images_layout_res,
-        )
+        with _metrics.phase_timer("vlm_local_postprocess"):
+            window_model_list, local_context = await asyncio.to_thread(
+                _process_ocr_and_formulas,
+                images_pil_list,
+                window_model_list,
+                language,
+                False,
+                batch_ratio,
+                local_context=local_context,
+                images_layout_res=images_layout_res,
+            )
     return window_model_list, local_context
 
 
@@ -1983,19 +2001,24 @@ def doc_analyze(
     else:
         vlm_runtime = _load_vlm_runtime()
         if predictor is None:
-            predictor = vlm_runtime["ModelSingleton"]().get_model(backend, model_path, server_url, **kwargs)
-        predictor = vlm_runtime["_maybe_enable_serial_execution"](predictor, backend)
+            with _metrics.phase_timer("model_acquisition", effort=effort, backend=backend):
+                predictor = vlm_runtime["ModelSingleton"]().get_model(backend, model_path, server_url, **kwargs)
+        with _metrics.phase_timer("model_acquisition", effort=effort, backend=backend):
+            predictor = vlm_runtime["_maybe_enable_serial_execution"](predictor, backend)
 
     device = get_device()
 
-    pdf_doc = PDFDocument(pdf_bytes)
-    _ocr_enable = ocr_classify(pdf_doc, parse_method=parse_method)
+    with _metrics.phase_timer("pdf_open", effort=effort, backend=backend):
+        pdf_doc = PDFDocument(pdf_bytes)
+    with _metrics.phase_timer("ocr_classification", effort=effort, backend=backend):
+        _ocr_enable = ocr_classify(pdf_doc, parse_method=parse_method)
     use_vlm_text_content = effort in {LAYOUT_HYBRID_EFFORT, MAX_HYBRID_EFFORT} and _ocr_enable
 
     middle_json: list[PageInfo] = []
     model_list: list[list[dict[str, Any]]] = []
     doc_closed = False
     local_context = None
+    phase_tokens = _metrics.bind_phase_labels(effort=effort, backend=backend)
     try:
         page_count = pdf_doc.page_count
         configured_window_size = get_processing_window_size(default=64)
@@ -2009,12 +2032,13 @@ def doc_analyze(
         last_append_end_time = None
         try:
             for window in windows:
-                images_list = load_images_from_pdf_bytes_range(
-                    pdf_bytes=pdf_bytes,
-                    start_page_id=window.start,
-                    end_page_id=window.end,
-                    image_type=ImageType.PIL,
-                )
+                with _metrics.phase_timer("pdf_window_render", effort=effort, backend=backend):
+                    images_list = load_images_from_pdf_bytes_range(
+                        pdf_bytes=pdf_bytes,
+                        start_page_id=window.start,
+                        end_page_id=window.end,
+                        image_type=ImageType.PIL,
+                    )
                 try:
                     images_pil_list = [image_dict["img_pil"] for image_dict in images_list]
                     _log_processing_window(window, page_count, len(images_pil_list))
@@ -2037,30 +2061,34 @@ def doc_analyze(
                     elif effort == MAX_HYBRID_EFFORT:
                         if _ocr_enable:
                             with vlm_runtime["predictor_execution_guard"](predictor):
-                                window_model_list = predictor.batch_two_step_extract(
-                                    images=images_pil_list,
-                                    image_analysis=image_analysis,
+                                with _metrics.phase_timer("vlm_extraction", effort=effort, backend=backend):
+                                    window_model_list = predictor.batch_two_step_extract(
+                                        images=images_pil_list,
+                                        image_analysis=image_analysis,
+                                    )
+                            with _metrics.phase_timer("vlm_local_postprocess", effort=effort, backend=backend):
+                                local_context = _apply_vlm_text_det_sidecars_for_window(
+                                    images_pil_list,
+                                    window_model_list,
+                                    language,
+                                    batch_ratio,
                                 )
-                            local_context = _apply_vlm_text_det_sidecars_for_window(
-                                images_pil_list,
-                                window_model_list,
-                                language,
-                                batch_ratio,
-                            )
                         else:
                             with vlm_runtime["predictor_execution_guard"](predictor):
-                                window_model_list = predictor.batch_two_step_extract(
-                                    images=images_pil_list,
-                                    not_extract_list=list(NOT_EXTRACT_TYPES),
-                                    image_analysis=image_analysis,
+                                with _metrics.phase_timer("vlm_extraction", effort=effort, backend=backend):
+                                    window_model_list = predictor.batch_two_step_extract(
+                                        images=images_pil_list,
+                                        not_extract_list=list(NOT_EXTRACT_TYPES),
+                                        image_analysis=image_analysis,
+                                    )
+                            with _metrics.phase_timer("vlm_local_postprocess", effort=effort, backend=backend):
+                                window_model_list, local_context = _process_ocr_and_formulas(
+                                    images_pil_list,
+                                    window_model_list,
+                                    language,
+                                    False,
+                                    batch_ratio=batch_ratio,
                                 )
-                            window_model_list, local_context = _process_ocr_and_formulas(
-                                images_pil_list,
-                                window_model_list,
-                                language,
-                                False,
-                                batch_ratio=batch_ratio,
-                            )
                     else:
                         raise ValueError(f"Unsupported hybrid effort: {effort}")
 
@@ -2073,19 +2101,20 @@ def doc_analyze(
                             last_append_end_time,
                             now=time.time(),
                         )
-                    append_pages(
-                        middle_json,
-                        window_model_list,
-                        images_list,
-                        pdf_doc,
-                        page_cvt_fn=blocks_to_page_info,
-                        page_start_index=window.start,
-                        page_index_map=page_index_map,
-                        _ocr_enable=_ocr_enable,
-                        use_vlm_text_content=use_vlm_text_content,
-                        progress_bar=progress_bar,
-                        image_cache=image_cache,
-                    )
+                    with _metrics.phase_timer("page_assembly", effort=effort, backend=backend):
+                        append_pages(
+                            middle_json,
+                            window_model_list,
+                            images_list,
+                            pdf_doc,
+                            page_cvt_fn=blocks_to_page_info,
+                            page_start_index=window.start,
+                            page_index_map=page_index_map,
+                            _ocr_enable=_ocr_enable,
+                            use_vlm_text_content=use_vlm_text_content,
+                            progress_bar=progress_bar,
+                            image_cache=image_cache,
+                        )
                     last_append_end_time = time.time()
                 finally:
                     _close_images(images_list)
@@ -2099,21 +2128,24 @@ def doc_analyze(
                 f"processing-window infer finished, cost: {infer_time}, speed: {round(len(model_list) / infer_time, 3)} page/s"
             )
 
-        _finalize_hybrid_middle_json(
-            middle_json,
-            local_context,
-            _ocr_enable,
-            use_vlm_text_content,
-            effort=effort,
-            client_side_output_generation=client_side_output_generation,
-        )
+        with _metrics.phase_timer("finalization", effort=effort, backend=backend):
+            _finalize_hybrid_middle_json(
+                middle_json,
+                local_context,
+                _ocr_enable,
+                use_vlm_text_content,
+                effort=effort,
+                client_side_output_generation=client_side_output_generation,
+            )
         pdf_doc.close()
         doc_closed = True
-        clean_memory(device)
+        with _metrics.phase_timer("memory_cleanup", effort=effort, backend=backend):
+            clean_memory(device)
         return middle_json, model_list, use_vlm_text_content
     finally:
         if not doc_closed:
             pdf_doc.close()
+        _metrics.reset_phase_labels(phase_tokens)
 
 
 async def aio_doc_analyze(
@@ -2146,19 +2178,24 @@ async def aio_doc_analyze(
     else:
         vlm_runtime = _load_vlm_runtime()
         if predictor is None:
-            predictor = await vlm_runtime["_get_model_async"](backend, model_path, server_url, **kwargs)
-        predictor = vlm_runtime["_maybe_enable_serial_execution"](predictor, backend)
+            with _metrics.phase_timer("model_acquisition", effort=effort, backend=backend):
+                predictor = await vlm_runtime["_get_model_async"](backend, model_path, server_url, **kwargs)
+        with _metrics.phase_timer("model_acquisition", effort=effort, backend=backend):
+            predictor = vlm_runtime["_maybe_enable_serial_execution"](predictor, backend)
 
     device = get_device()
 
-    pdf_doc = PDFDocument(pdf_bytes)
-    _ocr_enable = ocr_classify(pdf_doc, parse_method=parse_method)
+    with _metrics.phase_timer("pdf_open", effort=effort, backend=backend):
+        pdf_doc = PDFDocument(pdf_bytes)
+    with _metrics.phase_timer("ocr_classification", effort=effort, backend=backend):
+        _ocr_enable = ocr_classify(pdf_doc, parse_method=parse_method)
     use_vlm_text_content = effort in {LAYOUT_HYBRID_EFFORT, MAX_HYBRID_EFFORT} and _ocr_enable
 
     middle_json: list[PageInfo] = []
     model_list = []
     doc_closed = False
     local_context = None
+    phase_tokens = _metrics.bind_phase_labels(effort=effort, backend=backend)
     try:
         page_count = pdf_doc.page_count
         configured_window_size = get_processing_window_size(default=64)
@@ -2172,12 +2209,13 @@ async def aio_doc_analyze(
         last_append_end_time = None
         try:
             for window in windows:
-                images_list = await aio_load_images_from_pdf_bytes_range(
-                    pdf_bytes,
-                    start_page_id=window.start,
-                    end_page_id=window.end,
-                    image_type=ImageType.PIL,
-                )
+                with _metrics.phase_timer("pdf_window_render", effort=effort, backend=backend):
+                    images_list = await aio_load_images_from_pdf_bytes_range(
+                        pdf_bytes,
+                        start_page_id=window.start,
+                        end_page_id=window.end,
+                        image_type=ImageType.PIL,
+                    )
                 try:
                     images_pil_list = [image_dict["img_pil"] for image_dict in images_list]
                     _log_processing_window(window, page_count, len(images_pil_list))
@@ -2204,35 +2242,39 @@ async def aio_doc_analyze(
                         if _ocr_enable:
                             _metrics.record_vlm_prompts(effort, len(images_pil_list))
                             async with vlm_runtime["aio_predictor_execution_guard"](predictor):
-                                window_model_list = await predictor.aio_batch_two_step_extract(
-                                    images=images_pil_list,
-                                    semaphore=vlm_runtime["get_shared_aio_semaphore"](predictor),
-                                    image_analysis=image_analysis,
+                                with _metrics.phase_timer("vlm_extraction", effort=effort, backend=backend):
+                                    window_model_list = await predictor.aio_batch_two_step_extract(
+                                        images=images_pil_list,
+                                        semaphore=vlm_runtime["get_shared_aio_semaphore"](predictor),
+                                        image_analysis=image_analysis,
+                                    )
+                            with _metrics.phase_timer("vlm_local_postprocess", effort=effort, backend=backend):
+                                local_context = await asyncio.to_thread(
+                                    _apply_vlm_text_det_sidecars_for_window,
+                                    images_pil_list,
+                                    window_model_list,
+                                    language,
+                                    batch_ratio,
                                 )
-                            local_context = await asyncio.to_thread(
-                                _apply_vlm_text_det_sidecars_for_window,
-                                images_pil_list,
-                                window_model_list,
-                                language,
-                                batch_ratio,
-                            )
                         else:
                             _metrics.record_vlm_prompts(effort, len(images_pil_list))
                             async with vlm_runtime["aio_predictor_execution_guard"](predictor):
-                                window_model_list = await predictor.aio_batch_two_step_extract(
-                                    images=images_pil_list,
-                                    not_extract_list=list(NOT_EXTRACT_TYPES),
-                                    semaphore=vlm_runtime["get_shared_aio_semaphore"](predictor),
-                                    image_analysis=image_analysis,
+                                with _metrics.phase_timer("vlm_extraction", effort=effort, backend=backend):
+                                    window_model_list = await predictor.aio_batch_two_step_extract(
+                                        images=images_pil_list,
+                                        not_extract_list=list(NOT_EXTRACT_TYPES),
+                                        semaphore=vlm_runtime["get_shared_aio_semaphore"](predictor),
+                                        image_analysis=image_analysis,
+                                    )
+                            with _metrics.phase_timer("vlm_local_postprocess", effort=effort, backend=backend):
+                                window_model_list, local_context = await asyncio.to_thread(
+                                    _process_ocr_and_formulas,
+                                    images_pil_list,
+                                    window_model_list,
+                                    language,
+                                    False,
+                                    batch_ratio=batch_ratio,
                                 )
-                            window_model_list, local_context = await asyncio.to_thread(
-                                _process_ocr_and_formulas,
-                                images_pil_list,
-                                window_model_list,
-                                language,
-                                False,
-                                batch_ratio=batch_ratio,
-                            )
                     else:
                         raise ValueError(f"Unsupported hybrid effort: {effort}")
 
@@ -2245,19 +2287,20 @@ async def aio_doc_analyze(
                             last_append_end_time,
                             now=time.time(),
                         )
-                    append_pages(
-                        middle_json,
-                        window_model_list,
-                        images_list,
-                        pdf_doc,
-                        page_cvt_fn=blocks_to_page_info,
-                        page_start_index=window.start,
-                        page_index_map=page_index_map,
-                        _ocr_enable=_ocr_enable,
-                        use_vlm_text_content=use_vlm_text_content,
-                        progress_bar=progress_bar,
-                        image_cache=image_cache,
-                    )
+                    with _metrics.phase_timer("page_assembly", effort=effort, backend=backend):
+                        append_pages(
+                            middle_json,
+                            window_model_list,
+                            images_list,
+                            pdf_doc,
+                            page_cvt_fn=blocks_to_page_info,
+                            page_start_index=window.start,
+                            page_index_map=page_index_map,
+                            _ocr_enable=_ocr_enable,
+                            use_vlm_text_content=use_vlm_text_content,
+                            progress_bar=progress_bar,
+                            image_cache=image_cache,
+                        )
                     last_append_end_time = time.time()
                 finally:
                     _close_images(images_list)
@@ -2271,19 +2314,22 @@ async def aio_doc_analyze(
                 f"processing-window infer finished, cost: {infer_time}, speed: {round(len(model_list) / infer_time, 3)} page/s"
             )
 
-        await asyncio.to_thread(
-            _finalize_hybrid_middle_json,
-            middle_json,
-            local_context,
-            _ocr_enable,
-            use_vlm_text_content,
-            effort=effort,
-            client_side_output_generation=client_side_output_generation,
-        )
+        with _metrics.phase_timer("finalization", effort=effort, backend=backend):
+            await asyncio.to_thread(
+                _finalize_hybrid_middle_json,
+                middle_json,
+                local_context,
+                _ocr_enable,
+                use_vlm_text_content,
+                effort=effort,
+                client_side_output_generation=client_side_output_generation,
+            )
         pdf_doc.close()
         doc_closed = True
-        clean_memory(device)
+        with _metrics.phase_timer("memory_cleanup", effort=effort, backend=backend):
+            clean_memory(device)
         return middle_json, model_list, use_vlm_text_content
     finally:
         if not doc_closed:
             pdf_doc.close()
+        _metrics.reset_phase_labels(phase_tokens)

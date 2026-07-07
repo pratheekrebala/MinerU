@@ -1365,33 +1365,38 @@ def _inline_output_files(
     file_store: FileStore,
     output_files: OutputFiles | None,
     output_formats: list[OutputFormat],
+    *,
+    tier: Tier | None = None,
+    effort: str | None = None,
+    backend: str | None = None,
 ) -> dict[str, Any]:
-    if output_files is None:
-        return {}
+    with _metrics.phase_timer("sync_inline_outputs", tier=tier, effort=effort, backend=backend):
+        if output_files is None:
+            return {}
 
-    requested = set(output_formats)
-    outputs: dict[str, Any] = {}
-    if "markdown" in requested:
-        outputs["markdown"] = _read_output(file_store, output_files.markdown)
-    for key in ("middle_json", "content_list", "structured_content"):
-        if key in requested:
-            outputs[key] = _read_output(file_store, getattr(output_files, key), as_json=True)
-    if "zip" in requested and output_files.zip is not None:
-        data = file_store.read_file_data(output_files.zip.file_id)
-        outputs["zip"] = {
-            "bytes": output_files.zip.bytes,
-            "data": base64.b64encode(data).decode("ascii"),
-        }
-    if "images" in requested and output_files.images:
-        outputs["images"] = [
-            {
-                "path": image.path,
-                "bytes": image.bytes,
-                "data": base64.b64encode(file_store.read_file_data(image.file_id)).decode("ascii"),
+        requested = set(output_formats)
+        outputs: dict[str, Any] = {}
+        if "markdown" in requested:
+            outputs["markdown"] = _read_output(file_store, output_files.markdown)
+        for key in ("middle_json", "content_list", "structured_content"):
+            if key in requested:
+                outputs[key] = _read_output(file_store, getattr(output_files, key), as_json=True)
+        if "zip" in requested and output_files.zip is not None:
+            data = file_store.read_file_data(output_files.zip.file_id)
+            outputs["zip"] = {
+                "bytes": output_files.zip.bytes,
+                "data": base64.b64encode(data).decode("ascii"),
             }
-            for image in output_files.images
-        ]
-    return outputs
+        if "images" in requested and output_files.images:
+            outputs["images"] = [
+                {
+                    "path": image.path,
+                    "bytes": image.bytes,
+                    "data": base64.b64encode(file_store.read_file_data(image.file_id)).decode("ascii"),
+                }
+                for image in output_files.images
+            ]
+        return outputs
 
 
 def _block_type_counts(pages: list[Any]) -> dict[str, int]:
@@ -1429,8 +1434,10 @@ async def _run_job(
             fr = rec.files[i]
             _metrics.jobs_inflight.inc()
             file_started = time.monotonic()
+            phase_tokens = _metrics.bind_phase_labels(tier=rec.tier, effort=effort, backend=server_backend)
             try:
-                data = await _extract_bytes(entry.source, file_store, url_timeout=url_timeout)
+                with _metrics.phase_timer("source_extract", tier=rec.tier, effort=effort, backend=server_backend):
+                    data = await _extract_bytes(entry.source, file_store, url_timeout=url_timeout)
                 stype = _suffix_type(fr.name)
                 if not stype:
                     raise ValueError(f"Unsupported file type: {fr.name}")
@@ -1438,21 +1445,23 @@ async def _run_job(
                 # write to temp file for parsers that require a path
                 suffix = pathlib.Path(fr.name).suffix or ".pdf"
                 tmp_path = pathlib.Path(tmpdir) / f"input_{i}{suffix}"
-                tmp_path.write_bytes(data)
+                with _metrics.phase_timer("temp_input_write", tier=rec.tier, effort=effort, backend=server_backend):
+                    tmp_path.write_bytes(data)
 
                 page_range = entry.page_range or ""
 
-                parse_started = time.monotonic()
-                result = await parse_async(
-                    str(tmp_path),
-                    tier=rec.tier,
-                    backend=server_backend,
-                    language=language,
-                    ocr_mode=ocr_mode,
-                    effort=effort,
-                    disable_image_analysis=not image_analysis,
-                    page_range=page_range,
-                )
+                with _metrics.phase_timer("parser_execution", tier=rec.tier, effort=effort, backend=server_backend):
+                    parse_started = time.monotonic()
+                    result = await parse_async(
+                        str(tmp_path),
+                        tier=rec.tier,
+                        backend=server_backend,
+                        language=language,
+                        ocr_mode=ocr_mode,
+                        effort=effort,
+                        disable_image_analysis=not image_analysis,
+                        page_range=page_range,
+                    )
                 _metrics.record_doc_result(
                     tier=rec.tier,
                     status="completed",
@@ -1464,56 +1473,57 @@ async def _run_job(
                 # collect outputs
                 out_formats = set(rec.output_formats)
                 output_files = OutputFiles()
-                image_output_refs = (
-                    _store_image_outputs(file_store, result.images()) if _needs_image_outputs(out_formats) else None
-                )
-                if image_output_refs is not None:
-                    output_files.images = image_output_refs
+                with _metrics.phase_timer("output_materialization", tier=rec.tier, effort=effort, backend=server_backend):
+                    image_output_refs = (
+                        _store_image_outputs(file_store, result.images()) if _needs_image_outputs(out_formats) else None
+                    )
+                    if image_output_refs is not None:
+                        output_files.images = image_output_refs
 
-                for fmt in (
-                    "markdown",
-                    "middle_json",
-                    "content_list",
-                    "structured_content",
-                    "images",
-                ):
-                    if fmt not in out_formats:
-                        continue
-                    if fmt == "markdown":
-                        md = result.markdown()
-                        content_bytes = _text_utf8_bytes(md or "")
-                        sha = hashlib.sha256(content_bytes).hexdigest()
-                        file_store.store_blob(content_bytes, sha256hex=sha)
-                        fid = file_store.create_file_for_output(f"{fr.name}.md", content_bytes, sha256hex=sha)
-                        output_files.markdown = OutputFileRef(file_id=fid, bytes=len(content_bytes))
-                    elif fmt == "middle_json":
-                        mj = _json_utf8_bytes(result.to_dict(skip_defaults=True))
-                        sha = hashlib.sha256(mj).hexdigest()
-                        file_store.store_blob(mj, sha256hex=sha)
-                        fid = file_store.create_file_for_output(f"{fr.name}.middle.json", mj, sha256hex=sha)
-                        output_files.middle_json = OutputFileRef(file_id=fid, bytes=len(mj))
-                    elif fmt == "content_list":
-                        cl = _json_utf8_bytes(result.content_list())
-                        sha = hashlib.sha256(cl).hexdigest()
-                        file_store.store_blob(cl, sha256hex=sha)
-                        fid = file_store.create_file_for_output(f"{fr.name}.content_list.json", cl, sha256hex=sha)
-                        output_files.content_list = OutputFileRef(file_id=fid, bytes=len(cl))
-                    elif fmt == "structured_content":
-                        cl2 = _json_utf8_bytes(result.structured_content())
-                        sha = hashlib.sha256(cl2).hexdigest()
-                        file_store.store_blob(cl2, sha256hex=sha)
-                        fid = file_store.create_file_for_output(f"{fr.name}.structured_content.json", cl2, sha256hex=sha)
-                        output_files.structured_content = OutputFileRef(file_id=fid, bytes=len(cl2))
-                    elif fmt == "images":
-                        continue
+                    for fmt in (
+                        "markdown",
+                        "middle_json",
+                        "content_list",
+                        "structured_content",
+                        "images",
+                    ):
+                        if fmt not in out_formats:
+                            continue
+                        if fmt == "markdown":
+                            md = result.markdown()
+                            content_bytes = _text_utf8_bytes(md or "")
+                            sha = hashlib.sha256(content_bytes).hexdigest()
+                            file_store.store_blob(content_bytes, sha256hex=sha)
+                            fid = file_store.create_file_for_output(f"{fr.name}.md", content_bytes, sha256hex=sha)
+                            output_files.markdown = OutputFileRef(file_id=fid, bytes=len(content_bytes))
+                        elif fmt == "middle_json":
+                            mj = _json_utf8_bytes(result.to_dict(skip_defaults=True))
+                            sha = hashlib.sha256(mj).hexdigest()
+                            file_store.store_blob(mj, sha256hex=sha)
+                            fid = file_store.create_file_for_output(f"{fr.name}.middle.json", mj, sha256hex=sha)
+                            output_files.middle_json = OutputFileRef(file_id=fid, bytes=len(mj))
+                        elif fmt == "content_list":
+                            cl = _json_utf8_bytes(result.content_list())
+                            sha = hashlib.sha256(cl).hexdigest()
+                            file_store.store_blob(cl, sha256hex=sha)
+                            fid = file_store.create_file_for_output(f"{fr.name}.content_list.json", cl, sha256hex=sha)
+                            output_files.content_list = OutputFileRef(file_id=fid, bytes=len(cl))
+                        elif fmt == "structured_content":
+                            cl2 = _json_utf8_bytes(result.structured_content())
+                            sha = hashlib.sha256(cl2).hexdigest()
+                            file_store.store_blob(cl2, sha256hex=sha)
+                            fid = file_store.create_file_for_output(f"{fr.name}.structured_content.json", cl2, sha256hex=sha)
+                            output_files.structured_content = OutputFileRef(file_id=fid, bytes=len(cl2))
+                        elif fmt == "images":
+                            continue
 
-                # zip
-                if "zip" in out_formats:
-                    zip_bytes = _build_self_contained_zip_output(result, pathlib.Path(fr.name).stem)
-                    zip_sha = hashlib.sha256(zip_bytes).hexdigest()
-                    file_store.store_blob(zip_bytes, sha256hex=zip_sha)
-                    zip_fid = file_store.create_file_for_output(f"{fr.name}.zip", zip_bytes, sha256hex=zip_sha)
-                    output_files.zip = OutputFileRef(file_id=zip_fid, bytes=len(zip_bytes))
+                    # zip
+                    if "zip" in out_formats:
+                        zip_bytes = _build_self_contained_zip_output(result, pathlib.Path(fr.name).stem)
+                        zip_sha = hashlib.sha256(zip_bytes).hexdigest()
+                        file_store.store_blob(zip_bytes, sha256hex=zip_sha)
+                        zip_fid = file_store.create_file_for_output(f"{fr.name}.zip", zip_bytes, sha256hex=zip_sha)
+                        output_files.zip = OutputFileRef(file_id=zip_fid, bytes=len(zip_bytes))
 
                 fr.status = "completed"
                 fr.page_range = _page_range_from_result_pages(result.pages)
@@ -1546,6 +1556,7 @@ async def _run_job(
                 )
             finally:
                 _metrics.jobs_inflight.dec()
+                _metrics.reset_phase_labels(phase_tokens)
 
     if rec.status != "canceled":
         if rec.progress.failed == rec.progress.total:
@@ -1886,7 +1897,14 @@ async def parse_sync(
                     page_range=file_result.page_range,
                     status=file_result.status,
                     parse=file_result.parse,
-                    outputs=_inline_output_files(sync_store, file_result.output_files, rec.output_formats),
+                    outputs=_inline_output_files(
+                        sync_store,
+                        file_result.output_files,
+                        rec.output_formats,
+                        tier=rec.tier,
+                        effort=kwargs["effort"],
+                        backend=kwargs["server_backend"],
+                    ),
                     error=file_result.error,
                 )
                 for file_result in rec.files

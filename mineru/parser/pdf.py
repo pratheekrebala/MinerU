@@ -20,6 +20,7 @@ from ..utils.backend_options import (
 )
 from ..utils.image_payload import ImagePayloadCache
 from .base import DocumentParser, ParseResult
+from . import metrics as _metrics
 
 _IMAGE_SUFFIXES = frozenset({"png", "jpeg", "jp2", "webp", "gif", "bmp", "jpg", "tiff"})
 
@@ -70,54 +71,60 @@ class PdfBaseParser(DocumentParser):
         if not path.exists():
             raise FileNotFoundError(path)
 
-        prepared = self._prepare_input(path, page_range)
+        with _metrics.phase_timer("pdf_input_preparation", effort=self.effort, backend=self.backend):
+            prepared = self._prepare_input(path, page_range)
         image_cache = ImagePayloadCache()
-        middle_json, model_output = self._run_analysis(
-            prepared.pdf_bytes,
-            page_index_map=prepared.retained_page_indices,
-            image_cache=image_cache,
-        )
-        self._insert_broken_pages(
-            middle_json,
-            prepared.retained_page_indices,
-            prepared.broken_page_indices,
-        )
-        return self._build_result(
-            middle_json,
-            prepared.pdf_bytes,
-            prepared.file_name,
-            retained_page_indices=prepared.retained_page_indices,
-            broken_page_indices=prepared.broken_page_indices,
-            image_cache=image_cache,
-            model_output=model_output,
-        )
+        with _metrics.phase_timer("pdf_backend_analysis", effort=self.effort, backend=self.backend):
+            middle_json, model_output = self._run_analysis(
+                prepared.pdf_bytes,
+                page_index_map=prepared.retained_page_indices,
+                image_cache=image_cache,
+            )
+        with _metrics.phase_timer("pdf_result_assembly", effort=self.effort, backend=self.backend):
+            self._insert_broken_pages(
+                middle_json,
+                prepared.retained_page_indices,
+                prepared.broken_page_indices,
+            )
+            return self._build_result(
+                middle_json,
+                prepared.pdf_bytes,
+                prepared.file_name,
+                retained_page_indices=prepared.retained_page_indices,
+                broken_page_indices=prepared.broken_page_indices,
+                image_cache=image_cache,
+                model_output=model_output,
+            )
 
     async def parse_async(self, path: str | Path, *, page_range: str = "") -> ParseResult:
         path = Path(path)
         if not path.exists():
             raise FileNotFoundError(path)
 
-        prepared = await asyncio.to_thread(self._prepare_input, path, page_range)
+        with _metrics.phase_timer("pdf_input_preparation", effort=self.effort, backend=self.backend):
+            prepared = await asyncio.to_thread(self._prepare_input, path, page_range)
         image_cache = ImagePayloadCache()
-        middle_json, model_output = await self._arun_analysis(
-            prepared.pdf_bytes,
-            page_index_map=prepared.retained_page_indices,
-            image_cache=image_cache,
-        )
-        self._insert_broken_pages(
-            middle_json,
-            prepared.retained_page_indices,
-            prepared.broken_page_indices,
-        )
-        return self._build_result(
-            middle_json,
-            prepared.pdf_bytes,
-            prepared.file_name,
-            retained_page_indices=prepared.retained_page_indices,
-            broken_page_indices=prepared.broken_page_indices,
-            image_cache=image_cache,
-            model_output=model_output,
-        )
+        with _metrics.phase_timer("pdf_backend_analysis", effort=self.effort, backend=self.backend):
+            middle_json, model_output = await self._arun_analysis(
+                prepared.pdf_bytes,
+                page_index_map=prepared.retained_page_indices,
+                image_cache=image_cache,
+            )
+        with _metrics.phase_timer("pdf_result_assembly", effort=self.effort, backend=self.backend):
+            self._insert_broken_pages(
+                middle_json,
+                prepared.retained_page_indices,
+                prepared.broken_page_indices,
+            )
+            return self._build_result(
+                middle_json,
+                prepared.pdf_bytes,
+                prepared.file_name,
+                retained_page_indices=prepared.retained_page_indices,
+                broken_page_indices=prepared.broken_page_indices,
+                image_cache=image_cache,
+                model_output=model_output,
+            )
 
     @abstractmethod
     def _run_analysis(
@@ -150,13 +157,15 @@ class PdfBaseParser(DocumentParser):
 
         suffix = guess_suffix_by_path(path)
         if suffix in _IMAGE_SUFFIXES:
-            pdf_bytes = PDFDocument.from_image(pdf_bytes).bytes
+            with _metrics.phase_timer("image_to_pdf_conversion", effort=self.effort, backend=self.backend):
+                pdf_bytes = PDFDocument.from_image(pdf_bytes).bytes
 
-        pdf_bytes, retained_page_indices, broken_page_indices = self._maybe_adjust_pdf_bytes(
-            pdf_bytes,
-            suffix,
-            page_range,
-        )
+        with _metrics.phase_timer("pdf_page_range_rewrite", effort=self.effort, backend=self.backend):
+            pdf_bytes, retained_page_indices, broken_page_indices = self._maybe_adjust_pdf_bytes(
+                pdf_bytes,
+                suffix,
+                page_range,
+            )
         return _PreparedPdfInput(
             file_name=file_name,
             pdf_bytes=pdf_bytes,
