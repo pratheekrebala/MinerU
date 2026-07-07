@@ -27,6 +27,54 @@ from .engine_utils import (
 )
 
 
+def _env_num(name: str, *, cast: Any, min_val: float | None = None, max_val: float | None = None) -> Any:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return None
+    try:
+        parsed = cast(value)
+    except (TypeError, ValueError):
+        logger.warning(f"Invalid {name} value: {value!r}; ignoring")
+        return None
+    if min_val is not None and parsed < min_val:
+        logger.warning(f"Invalid {name} value: {value!r}; expected >= {min_val}; ignoring")
+        return None
+    if max_val is not None and parsed > max_val:
+        logger.warning(f"Invalid {name} value: {value!r}; expected <= {max_val}; ignoring")
+        return None
+    return parsed
+
+
+def _env_bool(name: str) -> bool | None:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return None
+    normalized = value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    logger.warning(f"Invalid {name} value: {value!r}; ignoring")
+    return None
+
+
+def _apply_local_vllm_env_overrides(kwargs: dict[str, Any]) -> None:
+    overrides = {
+        "gpu_memory_utilization": _env_num(
+            "MINERU_VLLM_GPU_MEMORY_UTILIZATION",
+            cast=float,
+            min_val=0.0,
+            max_val=1.0,
+        ),
+        "max_model_len": _env_num("MINERU_VLLM_MAX_MODEL_LEN", cast=int, min_val=1),
+        "max_num_seqs": _env_num("MINERU_VLLM_MAX_NUM_SEQS", cast=int, min_val=1),
+        "enforce_eager": _env_bool("MINERU_VLLM_ENFORCE_EAGER"),
+    }
+    for key, value in overrides.items():
+        if value is not None and key not in kwargs:
+            kwargs[key] = value
+
+
 class ModelSingleton:
     _instance = None
     _models = {}
@@ -124,6 +172,7 @@ class ModelSingleton:
                             raise ImportError("Please install vllm to use the vllm-engine backend.")
 
                         kwargs = mod_kwargs_by_device_type(kwargs, vllm_mode="sync_engine")
+                        _apply_local_vllm_env_overrides(kwargs)
 
                         if "compilation_config" in kwargs:
                             if isinstance(kwargs["compilation_config"], str):
@@ -153,6 +202,7 @@ class ModelSingleton:
                             raise ImportError("Please install vllm to use the vllm-async-engine backend.")
 
                         kwargs = mod_kwargs_by_device_type(kwargs, vllm_mode="async_engine")
+                        _apply_local_vllm_env_overrides(kwargs)
 
                         if "compilation_config" in kwargs:
                             if isinstance(kwargs["compilation_config"], dict):
