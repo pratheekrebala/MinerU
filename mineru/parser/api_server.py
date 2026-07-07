@@ -36,12 +36,14 @@ from fastapi import APIRouter, Body, Depends, FastAPI, HTTPException, Path, Quer
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
+from prometheus_fastapi_instrumentator import Instrumentator
 
 from ..types import Tier, validate_tier
 from ..utils.backend_options import DEFAULT_HYBRID_EFFORT
 from ..utils.image_payload import validate_image_sidecar_path
 from ..utils.ocr_language import PUBLIC_OCR_LANGUAGES, validate_public_ocr_lang
 from ..version import __version__
+from . import metrics as _metrics
 from . import parse_async
 from .tier import (
     ParserRuntimeOptions,
@@ -1392,6 +1394,19 @@ def _inline_output_files(
     return outputs
 
 
+def _block_type_counts(pages: list[Any]) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for page in pages:
+        blocks = getattr(page, "para_blocks", None) or getattr(page, "blocks", None) or []
+        for block in blocks:
+            block_type = getattr(block, "type", None)
+            if block_type is None and isinstance(block, dict):
+                block_type = block.get("type")
+            label = str(block_type or "unknown")
+            counts[label] = counts.get(label, 0) + 1
+    return counts
+
+
 async def _run_job(
     rec: _JobRecord,
     req: CreateJobRequest,
@@ -1412,8 +1427,9 @@ async def _run_job(
             if rec.status == "canceled":
                 break
             fr = rec.files[i]
+            _metrics.jobs_inflight.inc()
+            file_started = time.monotonic()
             try:
-                file_started = time.monotonic()
                 data = await _extract_bytes(entry.source, file_store, url_timeout=url_timeout)
                 stype = _suffix_type(fr.name)
                 if not stype:
@@ -1426,6 +1442,7 @@ async def _run_job(
 
                 page_range = entry.page_range or ""
 
+                parse_started = time.monotonic()
                 result = await parse_async(
                     str(tmp_path),
                     tier=rec.tier,
@@ -1436,6 +1453,13 @@ async def _run_job(
                     disable_image_analysis=not image_analysis,
                     page_range=page_range,
                 )
+                _metrics.record_doc_result(
+                    tier=rec.tier,
+                    status="completed",
+                    elapsed=time.monotonic() - parse_started,
+                    page_count=len(result.pages),
+                )
+                _metrics.record_blocks(rec.tier, _block_type_counts(result.pages))
 
                 # collect outputs
                 out_formats = set(rec.output_formats)
@@ -1514,6 +1538,14 @@ async def _run_job(
                 fr.status = "failed"
                 fr.error = ErrorDetail(type="engine_error", code="parse_failed", message=str(exc))
                 rec.progress.failed += 1
+                _metrics.record_doc_result(
+                    tier=rec.tier,
+                    status="failed",
+                    elapsed=time.monotonic() - file_started,
+                    page_count=0,
+                )
+            finally:
+                _metrics.jobs_inflight.dec()
 
     if rec.status != "canceled":
         if rec.progress.failed == rec.progress.total:
@@ -2318,8 +2350,14 @@ def create_app(
     FileStore(_upload_dir).install(application.state)
     JobStore(concurrency=concurrency).install(application.state)
     application.add_middleware(GZipMiddleware, minimum_size=1000)
+    Instrumentator().instrument(application).expose(
+        application,
+        endpoint="/metrics",
+        include_in_schema=False,
+        tags=["Health"],
+    )
 
-    _PUBLIC_PATHS = frozenset({"/v1/health", "/v1/models", "/v1/tiers"})
+    _PUBLIC_PATHS = frozenset({"/v1/health", "/v1/models", "/v1/tiers", "/metrics"})
     _PUBLIC_PREFIXES = ("/openapi", "/docs", "/redoc")
 
     async def _auth_middleware(request: Request, call_next: Callable[[Request], Any]) -> Any:

@@ -17,6 +17,7 @@ from loguru import logger
 from PIL import Image
 from tqdm import tqdm
 
+from ...parser import metrics as _metrics
 from ...types import NOT_EXTRACT_TYPES, BBox, PageInfo
 from ...types import BlockType as MineruBlockType
 from ...utils.backend_options import (
@@ -2189,6 +2190,7 @@ async def aio_doc_analyze(
                             batch_ratio,
                         )
                     elif effort == LAYOUT_HYBRID_EFFORT:
+                        _metrics.record_vlm_prompts(effort, len(images_pil_list))
                         async with vlm_runtime["aio_predictor_execution_guard"](predictor):
                             window_model_list, local_context = await _aio_extract_high_with_local_layout(
                                 predictor,
@@ -2200,6 +2202,7 @@ async def aio_doc_analyze(
                             )
                     elif effort == MAX_HYBRID_EFFORT:
                         if _ocr_enable:
+                            _metrics.record_vlm_prompts(effort, len(images_pil_list))
                             async with vlm_runtime["aio_predictor_execution_guard"](predictor):
                                 window_model_list = await predictor.aio_batch_two_step_extract(
                                     images=images_pil_list,
@@ -2214,6 +2217,7 @@ async def aio_doc_analyze(
                                 batch_ratio,
                             )
                         else:
+                            _metrics.record_vlm_prompts(effort, len(images_pil_list))
                             async with vlm_runtime["aio_predictor_execution_guard"](predictor):
                                 window_model_list = await predictor.aio_batch_two_step_extract(
                                     images=images_pil_list,
