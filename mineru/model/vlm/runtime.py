@@ -291,6 +291,21 @@ async def _get_model_async(
     )
 
 
+def get_shared_aio_semaphore(predictor: MinerUClient) -> asyncio.Semaphore:
+    loop = asyncio.get_running_loop()
+    cached = getattr(predictor, "_mineru_shared_aio_semaphore", None)
+    if cached is not None:
+        cached_loop, cached_semaphore = cached
+        if cached_loop is loop:
+            return cached_semaphore
+
+    size = max(1, int(getattr(predictor, "max_concurrency", 100) or 100))
+    semaphore = asyncio.Semaphore(size)
+    predictor._mineru_shared_aio_semaphore = (loop, semaphore)
+    logger.info(f"Shared VLM aio semaphore initialized (size={size})")
+    return semaphore
+
+
 def _iter_shutdown_candidates(predictor: MinerUClient) -> Generator[object, None, None]:
     runtime_handles = getattr(predictor, "_mineru_runtime_handles", {})
     client = getattr(predictor, "client", None)
@@ -417,4 +432,3 @@ async def aio_predictor_execution_guard(predictor: MinerUClient) -> AsyncIterato
         yield
     finally:
         lock.release()
-

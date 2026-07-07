@@ -149,6 +149,7 @@ def _load_vlm_runtime() -> dict[str, Any]:
         _get_model_async,
         _maybe_enable_serial_execution,
         aio_predictor_execution_guard,
+        get_shared_aio_semaphore,
         predictor_execution_guard,
     )
 
@@ -157,6 +158,7 @@ def _load_vlm_runtime() -> dict[str, Any]:
         "_get_model_async": _get_model_async,
         "_maybe_enable_serial_execution": _maybe_enable_serial_execution,
         "aio_predictor_execution_guard": aio_predictor_execution_guard,
+        "get_shared_aio_semaphore": get_shared_aio_semaphore,
         "predictor_execution_guard": predictor_execution_guard,
     }
 
@@ -1726,6 +1728,7 @@ async def _aio_extract_high_with_local_layout(
     language: str | None,
     _ocr_enable: bool,
     batch_ratio: int,
+    semaphore: asyncio.Semaphore | None = None,
 ) -> tuple[list[list[dict[str, Any]]], HybridLocalModelContext]:
     """Hybrid high 异步路径：异步调用 VLM 的本地 layout 约束抽取，其余本地步骤放线程执行。"""
     local_context_singleton = HybridLocalModelContextSingleton()
@@ -1745,6 +1748,7 @@ async def _aio_extract_high_with_local_layout(
         images=images_pil_list,
         blocks_list=layout_blocks,
         not_extract_list=None if _ocr_enable else list(NOT_EXTRACT_TYPES),
+        semaphore=semaphore,
         image_analysis=False,
     )
     if _ocr_enable:
@@ -2192,12 +2196,14 @@ async def aio_doc_analyze(
                                 language,
                                 _ocr_enable,
                                 batch_ratio,
+                                semaphore=vlm_runtime["get_shared_aio_semaphore"](predictor),
                             )
                     elif effort == MAX_HYBRID_EFFORT:
                         if _ocr_enable:
                             async with vlm_runtime["aio_predictor_execution_guard"](predictor):
                                 window_model_list = await predictor.aio_batch_two_step_extract(
                                     images=images_pil_list,
+                                    semaphore=vlm_runtime["get_shared_aio_semaphore"](predictor),
                                     image_analysis=image_analysis,
                                 )
                             local_context = await asyncio.to_thread(
@@ -2212,6 +2218,7 @@ async def aio_doc_analyze(
                                 window_model_list = await predictor.aio_batch_two_step_extract(
                                     images=images_pil_list,
                                     not_extract_list=list(NOT_EXTRACT_TYPES),
+                                    semaphore=vlm_runtime["get_shared_aio_semaphore"](predictor),
                                     image_analysis=image_analysis,
                                 )
                             window_model_list, local_context = await asyncio.to_thread(
