@@ -92,7 +92,9 @@ def apply_local_cuda_memory_limit(device: str | torch.device | None = None) -> N
         _LOCAL_CUDA_MEMORY_LIMIT_APPLIED = True
         return
 
-    torch.cuda.set_per_process_memory_fraction(fraction, device=torch.device(device))
+    torch_device = torch.device(device)
+    device_index = torch_device.index if torch_device.index is not None else torch.cuda.current_device()
+    torch.cuda.set_per_process_memory_fraction(fraction, device=device_index)
     _LOCAL_CUDA_MEMORY_LIMIT_APPLIED = True
     logger.info(f"Applied local CUDA memory fraction limit: {fraction} on {device}")
 
