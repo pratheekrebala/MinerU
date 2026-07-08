@@ -27,7 +27,7 @@ from .pdfium_guard import close_pdfium_child, pdfium_guard
 
 DEFAULT_PDF_IMAGE_DPI = 200
 # DEFAULT_PDF_IMAGE_DPI = 144
-MAX_PDF_RENDER_PROCESSES = 3
+DEFAULT_MAX_PDF_RENDER_PROCESSES = 3
 MIN_PAGES_PER_RENDER_PROCESS = 30
 PDF_RENDER_PROCESS_SPAWN_DELAY_SECONDS = 0.1
 PDF_RENDER_TERMINATE_GRACE_PERIOD_SECONDS = 0.1
@@ -38,6 +38,21 @@ _pdf_render_executor_lock = threading.Lock()
 _pdf_render_spawn_submit_lock = threading.Lock()
 _pdf_render_spawn_submit_executor_id: int | None = None
 _pdf_render_spawn_submit_count = 0
+
+
+def _get_max_pdf_render_processes(default: int = DEFAULT_MAX_PDF_RENDER_PROCESSES) -> int:
+    value = os.getenv("MINERU_MAX_PDF_RENDER_PROCESSES")
+    if value is None or value == "":
+        return default
+    try:
+        max_processes = int(value)
+    except ValueError:
+        logger.warning(f"Invalid MINERU_MAX_PDF_RENDER_PROCESSES value: {value!r}; using {default}")
+        return default
+    if max_processes <= 0:
+        logger.warning(f"Invalid MINERU_MAX_PDF_RENDER_PROCESSES value: {value!r}; using {default}")
+        return default
+    return max_processes
 
 
 def pdf_page_to_image(
@@ -98,7 +113,7 @@ def _calculate_render_process_count(total_pages: int, threads: int, cpu_count: i
     return min(
         available_cpus,
         requested_threads,
-        MAX_PDF_RENDER_PROCESSES,
+        _get_max_pdf_render_processes(),
         page_limited_threads,
     )
 
@@ -139,7 +154,7 @@ def _get_pdf_render_pool_capacity(cpu_count: int | None = None) -> int:
     return min(
         available_cpus,
         configured_threads,
-        MAX_PDF_RENDER_PROCESSES,
+        _get_max_pdf_render_processes(),
     )
 
 

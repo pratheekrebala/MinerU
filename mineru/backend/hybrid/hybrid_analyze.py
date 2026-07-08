@@ -67,6 +67,7 @@ os.environ["PYTORCH_ENABLE_MPS_FALLBACK"] = "1"  # 让mps可以fallback
 LAYOUT_BASE_BATCH_SIZE = 1
 MFR_BASE_BATCH_SIZE = 16
 OCR_DET_BASE_BATCH_SIZE = 8
+DEFAULT_LAYOUT_MAX_BATCH_SIZE = 8
 LAYOUT_TITLE_SPLIT_OVERLAP_THRESHOLD = 0.8
 TABLE_OCR_REC_SINGLE_CHAR_REPLACEMENTS = {
     "香": "否",
@@ -76,6 +77,21 @@ TABLE_OCR_REC_REGEX_REPLACEMENTS = (
     # 仅规范化完整的“单个数字 + 號”，避免影响“10號”“第6號”等普通文本。
     (re.compile(r"^([0-9])號$"), r"\1"),
 )
+
+
+def _get_layout_max_batch_size(default: int = DEFAULT_LAYOUT_MAX_BATCH_SIZE) -> int:
+    value = os.getenv("MINERU_LAYOUT_MAX_BATCH_SIZE")
+    if value is None or value == "":
+        return default
+    try:
+        max_batch_size = int(value)
+    except ValueError:
+        logger.warning(f"Invalid MINERU_LAYOUT_MAX_BATCH_SIZE value: {value!r}; using {default}")
+        return default
+    if max_batch_size <= 0:
+        logger.warning(f"Invalid MINERU_LAYOUT_MAX_BATCH_SIZE value: {value!r}; using {default}")
+        return default
+    return max_batch_size
 
 
 @dataclass(frozen=True)
@@ -594,7 +610,7 @@ def _predict_layout_for_title_split(
     return run_layout_inference(
         local_context.layout_model.batch_predict,
         np_images,
-        batch_size=min(8, batch_ratio * LAYOUT_BASE_BATCH_SIZE),
+        batch_size=min(_get_layout_max_batch_size(), batch_ratio * LAYOUT_BASE_BATCH_SIZE),
     )
 
 
@@ -1460,7 +1476,7 @@ def _extract_with_local_layout(
         images_layout_res = run_layout_inference(
             local_context.layout_model.batch_predict,
             images_pil_list,
-            batch_size=min(8, batch_ratio * LAYOUT_BASE_BATCH_SIZE),
+            batch_size=min(_get_layout_max_batch_size(), batch_ratio * LAYOUT_BASE_BATCH_SIZE),
         )
     with _metrics.phase_timer("memory_cleanup"):
         clean_vram(local_context.device, vram_threshold=8)
