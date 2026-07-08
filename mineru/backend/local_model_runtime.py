@@ -42,6 +42,7 @@ LOCAL_MODEL_INIT_LOCK = threading.RLock()
 LOCAL_MODEL_LAYOUT_INFERENCE_LOCK = threading.RLock()
 LOCAL_MODEL_MFR_INFERENCE_LOCK = threading.RLock()
 LOCAL_MODEL_OCR_INFERENCE_LOCK = threading.RLock()
+_LOCAL_CUDA_MEMORY_LIMIT_APPLIED = False
 
 
 def _read_bool_env(primary_name: str, fallback_name: str | None = None, default: bool = False) -> bool:
@@ -60,6 +61,40 @@ LOCAL_MODEL_INFERENCE_LOCKS_ENABLED = _read_bool_env(
     fallback_name="MINERU_ENABLE_PIPELINE_INFERENCE_LOCKS",
     default=False,
 )
+
+
+def apply_local_cuda_memory_limit(device: str | torch.device | None = None) -> None:
+    """Optionally cap PyTorch CUDA allocator memory for non-vLLM local models."""
+    global _LOCAL_CUDA_MEMORY_LIMIT_APPLIED
+
+    if _LOCAL_CUDA_MEMORY_LIMIT_APPLIED:
+        return
+
+    raw_fraction = os.getenv("MINERU_LOCAL_CUDA_MEMORY_FRACTION")
+    if raw_fraction is None or raw_fraction == "":
+        return
+
+    try:
+        fraction = float(raw_fraction)
+    except ValueError:
+        logger.warning(f"Invalid MINERU_LOCAL_CUDA_MEMORY_FRACTION value: {raw_fraction!r}; ignoring")
+        _LOCAL_CUDA_MEMORY_LIMIT_APPLIED = True
+        return
+
+    if not 0 < fraction <= 1:
+        logger.warning(f"Invalid MINERU_LOCAL_CUDA_MEMORY_FRACTION value: {raw_fraction!r}; expected 0 < value <= 1")
+        _LOCAL_CUDA_MEMORY_LIMIT_APPLIED = True
+        return
+
+    if device is None:
+        device = get_device()
+    if not str(device).startswith("cuda"):
+        _LOCAL_CUDA_MEMORY_LIMIT_APPLIED = True
+        return
+
+    torch.cuda.set_per_process_memory_fraction(fraction, device=torch.device(device))
+    _LOCAL_CUDA_MEMORY_LIMIT_APPLIED = True
+    logger.info(f"Applied local CUDA memory fraction limit: {fraction} on {device}")
 
 
 def _run_with_inference_lock(
@@ -211,6 +246,7 @@ class AtomModelSingleton:
 
         with self._lock:
             if key not in self._models:
+                apply_local_cuda_memory_limit(kwargs.get("device"))
                 self._models[key] = atom_model_init(model_name=atom_model_name, **kwargs)
         return self._models[key]
 
