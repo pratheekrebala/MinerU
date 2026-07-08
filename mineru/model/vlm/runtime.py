@@ -439,6 +439,12 @@ def _clear_predictor_references(predictor: MinerUClient) -> None:
 
 
 def _shutdown_predictor_runtime(predictor: MinerUClient) -> None:
+    shutdown = getattr(predictor, "shutdown", None)
+    if callable(shutdown):
+        try:
+            shutdown()
+        except Exception as exc:
+            logger.debug(f"Failed to shutdown MinerU predictor wrapper: {exc}")
     for handle in _iter_shutdown_candidates(predictor):
         _shutdown_runtime_handle(handle)
     _clear_predictor_references(predictor)

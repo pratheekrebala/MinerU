@@ -24,6 +24,7 @@ import tempfile
 import threading
 import time
 import zipfile
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -142,6 +143,21 @@ def _env_flag(name: str, default: bool = True) -> bool:
     if val is None:
         return default
     return val.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _env_positive_int(name: str) -> int | None:
+    val = os.getenv(name)
+    if val is None or val == "":
+        return None
+    try:
+        parsed = int(val)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; expected a positive integer", name, val)
+        return None
+    if parsed <= 0:
+        logger.warning("Ignoring invalid %s=%r; expected a positive integer", name, val)
+        return None
+    return parsed
 
 
 def _install_managed_parse_server_stdin_watcher(server: Any) -> threading.Thread | None:
@@ -2319,6 +2335,7 @@ def create_app(
 
     @asynccontextmanager
     async def _lifespan(application: FastAPI) -> AsyncIterator[None]:
+        api_threadpool: ThreadPoolExecutor | None = None
         application.state.upload_dir = _upload_dir
         application.state.tier = tier
         application.state.default_tier = default_tier
@@ -2334,11 +2351,24 @@ def create_app(
         application.state.ocr_mode = ocr_mode
         application.state.effort = effort
         application.state.image_analysis = image_analysis
-        if _env_flag("MINERU_ENABLE_VLM_PRELOAD", default=False) and not os.getenv("MINERU_VLM_SERVER_URL"):
-            await _preload_local_vlm(tier_runtime_options)
-        yield
-        if not upload_dir and _upload_dir.exists():
-            shutil.rmtree(_upload_dir, ignore_errors=True)
+        api_threadpool_workers = _env_positive_int("MINERU_API_THREADPOOL_WORKERS")
+        if api_threadpool_workers is not None:
+            api_threadpool = ThreadPoolExecutor(
+                max_workers=api_threadpool_workers,
+                thread_name_prefix="mineru-api",
+            )
+            asyncio.get_running_loop().set_default_executor(api_threadpool)
+            application.state.api_threadpool = api_threadpool
+            logger.info("Configured API default threadpool with %s workers", api_threadpool_workers)
+        try:
+            if _env_flag("MINERU_ENABLE_VLM_PRELOAD", default=False) and not os.getenv("MINERU_VLM_SERVER_URL"):
+                await _preload_local_vlm(tier_runtime_options)
+            yield
+        finally:
+            if api_threadpool is not None:
+                api_threadpool.shutdown(wait=False, cancel_futures=True)
+            if not upload_dir and _upload_dir.exists():
+                shutil.rmtree(_upload_dir, ignore_errors=True)
 
     enable_docs = _env_flag("MINERU_API_ENABLE_FASTAPI_DOCS", default=True)
 
